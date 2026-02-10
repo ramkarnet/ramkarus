@@ -580,6 +580,162 @@ if st.button("🔍 TARAMAYI BAŞLAT", use_container_width=True):
     status.markdown('<div style="text-align:center;color:#7a8299;padding:20px;font-family:JetBrains Mono;font-size:0.8rem">📡 170+ hisse indiriliyor (retry destekli)...</div>', unsafe_allow_html=True)
 
     all_data, download_errors = cached_download()
-    progress.progress(40, text=f"✅ {len(all_data)} hisse indirildi | Analiz ediliyor...")
+    status.empty()
+    progress.progress(40, text=f"✅ {len(all_data)} hisse indirildi — analiz başlıyor...")
 
-   
+    results = []
+    analysis_errors = []
+    total = len(all_data)
+    symbols_list = list(all_data.items())
+
+    for i, (symbol, data) in enumerate(symbols_list):
+        try:
+            result = analyze_stock(symbol, data)
+            if result:
+                results.append(result)
+        except Exception as e:
+            logging.exception("analyze_stock failed for %s", symbol)
+            analysis_errors.append(symbol)
+
+        # Her 5 hissede bir güncelle (donma hissi olmasın)
+        if i % 5 == 0 or i == total - 1:
+            pct = 40 + int((i / max(total, 1)) * 55)
+            progress.progress(min(pct, 95), text=f"Analiz: {i+1}/{total} ({symbol})")
+
+    progress.progress(98, text="Sınıflandırılıyor...")
+
+    results.sort(key=sort_key)
+
+    wr_radar = [r for r in results if r.get('katman') == 'WR_RADAR']
+    wr_rejected = [r for r in results if r.get('katman') == 'WR_ELENDI']
+    watching = [r for r in results if r['score'] == 5 and r['priority'] >= 6]
+
+    progress.progress(100, text="Tamamlandı!")
+    time.sleep(0.3)
+    progress.empty()
+    status.empty()
+
+    st.session_state['results'] = results
+    st.session_state['wr_radar'] = wr_radar
+    st.session_state['wr_rejected'] = wr_rejected
+    st.session_state['watching'] = watching
+    st.session_state['scan_time'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+    st.session_state['download_errors'] = download_errors
+    st.session_state['analysis_errors'] = analysis_errors
+
+# Sonuçları göster
+if 'results' in st.session_state:
+    wr_radar = st.session_state['wr_radar']
+    wr_rejected = st.session_state['wr_rejected']
+    watching = st.session_state['watching']
+    results = st.session_state['results']
+    dl_errors = st.session_state.get('download_errors', [])
+    an_errors = st.session_state.get('analysis_errors', [])
+
+    # Header'ı sonuçlarla yeniden çiz (JavaScript ile güncelleme yerine info satırı)
+    scan_info = f"Son tarama: {st.session_state['scan_time']} | {len(results)} hisse analiz edildi"
+    total_errors = len(dl_errors) + len(an_errors)
+    if total_errors:
+        scan_info += f" | ⚠ {total_errors} hata"
+    st.markdown(f"<div style='text-align:center;font-size:0.7rem;color:#4a5168;margin-bottom:12px;font-family:JetBrains Mono'>{scan_info}</div>", unsafe_allow_html=True)
+
+    render_stats(len(wr_radar), len(wr_rejected), len(watching), len(results))
+
+    if wr_radar:
+        st.markdown("### 🏆 WR RADAR — İşlem Al")
+        for r in wr_radar:
+            render_signal_card(r, "signal")
+    else:
+        # Neden yok analizi
+        all_6_6 = [r for r in results if r['score'] == 6]
+        p6_count = len([r for r in all_6_6 if r['priority'] < 7])
+        adx_fail = len([r for r in all_6_6 if r['priority'] >= 7 and not (WR_ADX_MIN <= r['adx'] <= WR_ADX_MAX)])
+        mfi_fail = len([r for r in all_6_6 if r['priority'] >= 7 and r['adx'] >= WR_ADX_MIN and r['adx'] <= WR_ADX_MAX and r['mfi'] <= WR_MFI_MIN])
+
+        reasons_html = ""
+        if all_6_6:
+            lines = []
+            if p6_count: lines.append(f"• {p6_count} hisse 6/6 ama P6 (WR dışı)")
+            if adx_fail: lines.append(f"• {adx_fail} hisse P7 ama ADX 25-40 dışı")
+            if mfi_fail: lines.append(f"• {mfi_fail} hisse P7+ADX OK ama MFI ≤ 60")
+            if not lines: lines.append("• Hiçbir hisse 6/6 + P7'ye ulaşamadı")
+            reasons_html = "<br>".join(lines)
+        else:
+            reasons_html = "• Hiçbir hisse 6/6 skora ulaşamadı"
+
+        st.markdown(f"""
+        <div style="text-align:center;padding:24px;background:#12151c;border:1px solid #252a36;border-radius:8px;margin:12px 0">
+            <div style="font-size:2rem">🔇</div>
+            <div style="color:#7a8299;font-size:0.95rem;margin-top:8px;font-weight:600">Bugün WR sinyali yok — sabır!</div>
+            <div style="color:#4a5168;font-size:0.75rem;margin-top:4px">Ayda ~1.8 sinyal bekleniyor</div>
+            <div style="text-align:left;margin-top:16px;padding:12px;background:#0a0c10;border-radius:6px">
+                <div style="font-family:'JetBrains Mono';font-size:0.7rem;color:#f59e0b;margin-bottom:6px">NEDEN YOK?</div>
+                <div style="font-family:'JetBrains Mono';font-size:0.7rem;color:#7a8299;line-height:1.6">{reasons_html}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # En yakın adaylar — 5/6 skorlu, sadece 1 kriter eksik, P6+ olanlar
+    almost_there = [r for r in results if r['score'] == 5 and r['priority'] >= 6]
+    # ADX ve MFI'ya en yakın olanları öne al
+    almost_sorted = sorted(almost_there, key=lambda r: (
+        -r['priority'],
+        -(1 if WR_ADX_MIN <= r['adx'] <= WR_ADX_MAX else 0),
+        -(1 if r['mfi'] > WR_MFI_MIN else 0),
+        -r['mfi']
+    ))[:5]
+
+    if almost_sorted and not wr_radar:
+        st.markdown("""
+        <div style="margin:16px 0 8px 0;font-family:'JetBrains Mono';font-size:0.75rem;color:#3b82f6">
+            🔜 EN YAKIN ADAYLAR — 1 kriter kaldı
+        </div>
+        """, unsafe_allow_html=True)
+        for r in almost_sorted:
+            missing = []
+            if not r['k1']: missing.append("K1:Trend")
+            if not r['k2']: missing.append("K2:ADX")
+            if not r['k3']: missing.append("K3:Hacim")
+            if not r['k4']: missing.append("K4:SAR")
+            if not r['k5']: missing.append("K5:Mesafe")
+            if not r['k6']: missing.append("K6:MFI")
+            missing_str = ", ".join(missing)
+
+            adx_ok = "✓" if WR_ADX_MIN <= r['adx'] <= WR_ADX_MAX else "✗"
+            mfi_ok = "✓" if r['mfi'] > WR_MFI_MIN else "✗"
+
+            st.markdown(f"""
+            <div style="background:#12151c;border:1px solid #1e3a5f;border-left:3px solid #3b82f6;border-radius:8px;padding:12px;margin-bottom:8px">
+                <div style="display:flex;justify-content:space-between">
+                    <span style="font-family:'JetBrains Mono';font-weight:700;color:#e4e8f0">{r['symbol']}</span>
+                    <span style="font-family:'JetBrains Mono';font-size:0.8rem;color:#7a8299">${r['price']}</span>
+                </div>
+                <div style="font-family:'JetBrains Mono';font-size:0.7rem;color:#ef4444;margin-top:4px">Eksik: {missing_str}</div>
+                <div style="font-family:'JetBrains Mono';font-size:0.65rem;color:#4a5168;margin-top:2px">P{r['priority']} | ADX {r['adx']} {adx_ok} | MFI {r['mfi']} {mfi_ok} | 5D: {'+' if r['price_5d']>=0 else ''}{r['price_5d']}%</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    if wr_rejected:
+        with st.expander(f"⚠ Elenenler ({len(wr_rejected)}) — 6/6 ama WR filtresi dışı"):
+            for r in wr_rejected:
+                render_signal_card(r, "rejected")
+
+    if watching:
+        with st.expander(f"👁 İzleme ({len(watching)}) — 5/6 skorlu yakın adaylar"):
+            for r in watching[:20]:
+                render_signal_card(r, "watching")
+
+else:
+    st.markdown("""
+    <div style="text-align:center;padding:60px 20px">
+        <div style="font-size:3rem;margin-bottom:16px">🎯</div>
+        <div style="color:#7a8299;font-size:1rem">Taramayı başlatmak için butona bas</div>
+        <div style="color:#4a5168;font-size:0.8rem;margin-top:8px">170+ Shariah hisse • WR Mode • Wilder RMA • ~60 saniye</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+st.markdown("""
+<div style="text-align:center;margin-top:40px;padding:16px;border-top:1px solid #252a36;font-size:0.65rem;color:#4a5168;font-family:'JetBrains Mono',monospace">
+    RAMKAR-US WR v1.2 | Scanner ile birebir senkron | ⚠ Yatırım tavsiyesi değildir
+</div>
+""", unsafe_allow_html=True)
