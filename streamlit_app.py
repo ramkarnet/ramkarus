@@ -17,6 +17,9 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import time
+import logging
+
+logging.basicConfig(level=logging.WARNING, format='%(asctime)s %(levelname)s %(message)s')
 
 # ==============================================================================
 # SAYFA AYARLARI
@@ -256,39 +259,47 @@ def calculate_sar(data, af_start=0.02, af_step=0.02, af_max=0.2):
 # BATCH İNDİRME — scanner'dan birebir
 # ==============================================================================
 
-def download_batch_data(symbols, period="90d", max_retry=MAX_RETRY):
+def download_batch_data(symbols, period="90d", max_retry=MAX_RETRY, chunk_size=40):
+    """Chunked download + exponential backoff — 170+ hisseyi 40'lık gruplarda indir."""
     all_data = {}
-    remaining = list(symbols)
     errors = []
 
-    for attempt in range(1, max_retry + 1):
-        if not remaining:
-            break
-        try:
-            raw = yf.download(
-                remaining, period=period, interval="1d",
-                group_by='ticker', threads=True, progress=False
-            )
-            success_this_round = []
-            for symbol in remaining:
-                try:
-                    if len(remaining) == 1:
-                        df = raw[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
-                    else:
-                        df = raw[symbol][['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
-                    if len(df) >= 50:
-                        all_data[symbol] = df
-                        success_this_round.append(symbol)
-                except Exception:
-                    pass
-            remaining = [s for s in remaining if s not in success_this_round]
-        except Exception:
-            pass
+    # Chunk'lara böl
+    chunks = [symbols[i:i+chunk_size] for i in range(0, len(symbols), chunk_size)]
 
-        if remaining and attempt < max_retry:
-            time.sleep(RETRY_DELAY)
+    for chunk_idx, chunk in enumerate(chunks):
+        remaining = list(chunk)
 
-    errors = remaining
+        for attempt in range(1, max_retry + 1):
+            if not remaining:
+                break
+            try:
+                raw = yf.download(
+                    remaining, period=period, interval="1d",
+                    group_by='ticker', threads=True, progress=False
+                )
+                success_this_round = []
+                for symbol in remaining:
+                    try:
+                        if len(remaining) == 1:
+                            df = raw[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+                        else:
+                            df = raw[symbol][['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+                        if len(df) >= 50:
+                            all_data[symbol] = df
+                            success_this_round.append(symbol)
+                    except Exception:
+                        pass
+                remaining = [s for s in remaining if s not in success_this_round]
+            except Exception as e:
+                logging.warning("Chunk %d attempt %d failed: %s", chunk_idx, attempt, e)
+
+            if remaining and attempt < max_retry:
+                backoff = RETRY_DELAY * (2 ** (attempt - 1))  # exponential: 2, 4, 8...
+                time.sleep(backoff)
+
+        errors.extend(remaining)
+
     return all_data, errors
 
 # ==============================================================================
@@ -374,6 +385,16 @@ def analyze_stock(symbol, data):
             if not wr_mfi_ok:
                 wr_reasons.append(f"MFI {last_mfi:.0f} ≤ 60")
 
+        # Katman (scanner ile birebir)
+        if wr_pass:
+            katman = "WR_RADAR"
+        elif score == 6 and priority >= 6:
+            katman = "WR_ELENDI"
+        elif score >= 4:
+            katman = "IZLEME"
+        else:
+            katman = "DIGER"
+
         stop_price = last['Close'] - (last_atr * ATR_STOP_P7)
         stop_pct = ((last['Close'] - stop_price) / last['Close']) * 100
         target_price = last['Close'] * (1 + P7_TP_PCT)
@@ -401,13 +422,18 @@ def analyze_stock(symbol, data):
             'price_5d': round(float(price_5d), 1),
             'wr_pass': wr_pass,
             'wr_reasons': wr_reasons,
+            'katman': katman,
             'k1': k1, 'k2': k2, 'k3': k3, 'k4': k4, 'k5': k5, 'k6': k6,
         }
     except Exception:
         return None
 
+@st.cache_data(ttl=300, show_spinner=False)  # 5 dakika cache
+def cached_download(period="90d"):
+    """Cache'li indirme — aynı 5dk içinde tekrar basarsan yeniden indirmez."""
+    return download_batch_data(SPUS_SHARIAH_STOCKS, period=period)
+
 # ==============================================================================
-# SIRALAMA — scanner'dan birebir
 # ==============================================================================
 
 def sort_key(r):
@@ -497,10 +523,11 @@ if st.button("🔍 TARAMAYI BAŞLAT", use_container_width=True):
 
     status.markdown('<div style="text-align:center;color:#7a8299;padding:20px;font-family:JetBrains Mono;font-size:0.8rem">📡 170+ hisse indiriliyor (retry destekli)...</div>', unsafe_allow_html=True)
 
-    all_data, download_errors = download_batch_data(SPUS_SHARIAH_STOCKS)
+    all_data, download_errors = cached_download()
     progress.progress(40, text=f"✅ {len(all_data)} hisse indirildi | Analiz ediliyor...")
 
     results = []
+    analysis_errors = []
     total = len(all_data)
 
     for i, (symbol, data) in enumerate(all_data.items()):
@@ -508,8 +535,9 @@ if st.button("🔍 TARAMAYI BAŞLAT", use_container_width=True):
             result = analyze_stock(symbol, data)
             if result:
                 results.append(result)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.exception("analyze_stock failed for %s", symbol)
+            analysis_errors.append(symbol)
         if i % 20 == 0:
             pct = 40 + int((i / max(total, 1)) * 55)
             progress.progress(min(pct, 95), text=f"Analiz: {i}/{total}")
@@ -518,8 +546,8 @@ if st.button("🔍 TARAMAYI BAŞLAT", use_container_width=True):
 
     results.sort(key=sort_key)
 
-    wr_radar = [r for r in results if r['wr_pass']]
-    wr_rejected = [r for r in results if r['score'] == 6 and r['priority'] >= 6 and not r['wr_pass']]
+    wr_radar = [r for r in results if r.get('katman') == 'WR_RADAR']
+    wr_rejected = [r for r in results if r.get('katman') == 'WR_ELENDI']
     watching = [r for r in results if r['score'] == 5 and r['priority'] >= 6]
 
     progress.progress(100, text="Tamamlandı!")
@@ -533,6 +561,7 @@ if st.button("🔍 TARAMAYI BAŞLAT", use_container_width=True):
     st.session_state['watching'] = watching
     st.session_state['scan_time'] = datetime.now().strftime('%Y-%m-%d %H:%M')
     st.session_state['download_errors'] = download_errors
+    st.session_state['analysis_errors'] = analysis_errors
 
 # Sonuçları göster
 if 'results' in st.session_state:
@@ -541,10 +570,12 @@ if 'results' in st.session_state:
     watching = st.session_state['watching']
     results = st.session_state['results']
     dl_errors = st.session_state.get('download_errors', [])
+    an_errors = st.session_state.get('analysis_errors', [])
 
     scan_info = f"Son tarama: {st.session_state['scan_time']} | {len(results)} hisse analiz edildi"
-    if dl_errors:
-        scan_info += f" | ⚠ {len(dl_errors)} hata"
+    total_errors = len(dl_errors) + len(an_errors)
+    if total_errors:
+        scan_info += f" | ⚠ {total_errors} hata ({len(dl_errors)} indirme, {len(an_errors)} analiz)"
     st.markdown(f"<div style='text-align:center;font-size:0.7rem;color:#4a5168;margin-bottom:12px;font-family:JetBrains Mono'>{scan_info}</div>", unsafe_allow_html=True)
 
     render_stats(len(wr_radar), len(wr_rejected), len(watching), len(results))
