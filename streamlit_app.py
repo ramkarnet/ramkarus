@@ -17,6 +17,9 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import time
+import logging
+
+logging.basicConfig(level=logging.WARNING, format='%(asctime)s %(levelname)s %(message)s')
 
 # ==============================================================================
 # SAYFA AYARLARI
@@ -256,39 +259,47 @@ def calculate_sar(data, af_start=0.02, af_step=0.02, af_max=0.2):
 # BATCH İNDİRME — scanner'dan birebir
 # ==============================================================================
 
-def download_batch_data(symbols, period="90d", max_retry=MAX_RETRY):
+def download_batch_data(symbols, period="90d", max_retry=MAX_RETRY, chunk_size=40):
+    """Chunked download + exponential backoff — 170+ hisseyi 40'lık gruplarda indir."""
     all_data = {}
-    remaining = list(symbols)
     errors = []
 
-    for attempt in range(1, max_retry + 1):
-        if not remaining:
-            break
-        try:
-            raw = yf.download(
-                remaining, period=period, interval="1d",
-                group_by='ticker', threads=True, progress=False
-            )
-            success_this_round = []
-            for symbol in remaining:
-                try:
-                    if len(remaining) == 1:
-                        df = raw[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
-                    else:
-                        df = raw[symbol][['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
-                    if len(df) >= 50:
-                        all_data[symbol] = df
-                        success_this_round.append(symbol)
-                except Exception:
-                    pass
-            remaining = [s for s in remaining if s not in success_this_round]
-        except Exception:
-            pass
+    # Chunk'lara böl
+    chunks = [symbols[i:i+chunk_size] for i in range(0, len(symbols), chunk_size)]
 
-        if remaining and attempt < max_retry:
-            time.sleep(RETRY_DELAY)
+    for chunk_idx, chunk in enumerate(chunks):
+        remaining = list(chunk)
 
-    errors = remaining
+        for attempt in range(1, max_retry + 1):
+            if not remaining:
+                break
+            try:
+                raw = yf.download(
+                    remaining, period=period, interval="1d",
+                    group_by='ticker', threads=True, progress=False
+                )
+                success_this_round = []
+                for symbol in remaining:
+                    try:
+                        if len(remaining) == 1:
+                            df = raw[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+                        else:
+                            df = raw[symbol][['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+                        if len(df) >= 50:
+                            all_data[symbol] = df
+                            success_this_round.append(symbol)
+                    except Exception:
+                        pass
+                remaining = [s for s in remaining if s not in success_this_round]
+            except Exception as e:
+                logging.warning("Chunk %d attempt %d failed: %s", chunk_idx, attempt, e)
+
+            if remaining and attempt < max_retry:
+                backoff = RETRY_DELAY * (2 ** (attempt - 1))  # exponential: 2, 4, 8...
+                time.sleep(backoff)
+
+        errors.extend(remaining)
+
     return all_data, errors
 
 # ==============================================================================
@@ -374,6 +385,16 @@ def analyze_stock(symbol, data):
             if not wr_mfi_ok:
                 wr_reasons.append(f"MFI {last_mfi:.0f} ≤ 60")
 
+        # Katman (scanner ile birebir)
+        if wr_pass:
+            katman = "WR_RADAR"
+        elif score == 6 and priority >= 6:
+            katman = "WR_ELENDI"
+        elif score >= 4:
+            katman = "IZLEME"
+        else:
+            katman = "DIGER"
+
         stop_price = last['Close'] - (last_atr * ATR_STOP_P7)
         stop_pct = ((last['Close'] - stop_price) / last['Close']) * 100
         target_price = last['Close'] * (1 + P7_TP_PCT)
@@ -401,13 +422,18 @@ def analyze_stock(symbol, data):
             'price_5d': round(float(price_5d), 1),
             'wr_pass': wr_pass,
             'wr_reasons': wr_reasons,
+            'katman': katman,
             'k1': k1, 'k2': k2, 'k3': k3, 'k4': k4, 'k5': k5, 'k6': k6,
         }
     except Exception:
         return None
 
+@st.cache_data(ttl=300, show_spinner=False)  # 5 dakika cache
+def cached_download(period="90d"):
+    """Cache'li indirme — aynı 5dk içinde tekrar basarsan yeniden indirmez."""
+    return download_batch_data(SPUS_SHARIAH_STOCKS, period=period)
+
 # ==============================================================================
-# SIRALAMA — scanner'dan birebir
 # ==============================================================================
 
 def sort_key(r):
@@ -426,12 +452,43 @@ def sort_key(r):
 # UI COMPONENTS
 # ==============================================================================
 
-def render_header():
-    st.markdown("""
+def render_header(scan_time=None, wr_count=None):
+    # Market durumu (US Eastern)
+    from datetime import timezone, timedelta
+    utc_now = datetime.utcnow()
+    et_offset = timedelta(hours=-5)  # EST (kış)
+    et_now = utc_now + et_offset
+    et_hour = et_now.hour
+    if et_now.weekday() >= 5:
+        market_status = "🔴 WEEKEND"
+    elif 9 <= et_hour < 16:
+        market_status = "🟢 MARKET OPEN"
+    else:
+        market_status = "🔵 MARKET CLOSED"
+
+    scan_line = f"Scan: {scan_time}" if scan_time else "Tarama bekleniyor"
+
+    if wr_count is not None:
+        if wr_count > 0:
+            status_html = f'<div style="font-size:1.1rem;font-weight:700;color:#22c55e;margin-top:8px">🏆 {wr_count} WR SİNYAL</div>'
+        else:
+            status_html = '<div style="font-size:1.1rem;font-weight:700;color:#7a8299;margin-top:8px">🔇 BUGÜN İŞLEM YOK</div>'
+    else:
+        status_html = '<div style="font-size:0.9rem;color:#7a8299;margin-top:8px">⏳ Tarama başlatılmadı</div>'
+
+    st.markdown(f"""
     <div class="main-header">
-        <div class="badge">WR MODE v1.2</div>
-        <h1>RAMKAR-US</h1>
-        <div class="sub">P7 + ADX 25-40 + MFI&gt;60 | BT: 21T WR %76 Sharpe 0.36</div>
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap">
+            <div>
+                <div class="badge">WR MODE v1.2</div>
+                <h1>RAMKAR-US</h1>
+            </div>
+            <div style="text-align:right">
+                <div style="font-family:'JetBrains Mono';font-size:0.7rem;color:#7a8299">{market_status} | {scan_line}</div>
+                <div style="font-family:'JetBrains Mono';font-size:0.6rem;color:#4a5168;margin-top:2px">🔒 LOCKED: P7 | ADX 25-40 | MFI &gt;60 | Stop 2.5x ATR</div>
+            </div>
+        </div>
+        {status_html}
     </div>
     """, unsafe_allow_html=True)
 
@@ -445,6 +502,12 @@ def render_stats(wr_count, rejected_count, watching_count, total):
     </div>
     """, unsafe_allow_html=True)
 
+def calc_confidence(adx, mfi):
+    """WR confidence: ADX 30 optimal, MFI 80 optimal"""
+    adx_score = max(0, 1 - abs(adx - 32.5) / 15) * 50  # 25-40, peak at 32.5
+    mfi_score = min((mfi - 60) / 30, 1) * 50  # 60-90 arası
+    return min(int(adx_score + mfi_score), 100)
+
 def render_signal_card(r, card_type="signal"):
     css_class = "" if card_type == "signal" else ("rejected" if card_type == "rejected" else "watching")
     criteria = "".join(["✓" if c else "✗" for c in [r['k1'], r['k2'], r['k3'], r['k4'], r['k5'], r['k6']]])
@@ -456,7 +519,25 @@ def render_signal_card(r, card_type="signal"):
     if r['wr_reasons']:
         reject_html = f'<div class="reject-reason">⚠ {" | ".join(r["wr_reasons"])}</div>'
 
+    # RR Ratio
+    rr = 15.0 / r['stop_pct'] if r['stop_pct'] > 0 else 0
+    rr_class = "green" if rr >= 2 else "amber"
+    rr_html = f'<span class="tag {rr_class}">RR 1:{rr:.1f}</span>' if card_type == "signal" else ""
+
     target_html = f'<span class="tag green">TP ${r["target"]}</span>' if card_type == "signal" else ""
+
+    # Confidence bar (sadece WR RADAR için)
+    conf_html = ""
+    if card_type == "signal":
+        conf = calc_confidence(r['adx'], r['mfi'])
+        filled = conf // 10
+        empty = 10 - filled
+        conf_color = "#22c55e" if conf >= 70 else ("#f59e0b" if conf >= 50 else "#ef4444")
+        conf_html = f'''
+        <div style="margin-top:8px;font-family:'JetBrains Mono';font-size:0.7rem">
+            <span style="color:#7a8299">CONFIDENCE</span>
+            <span style="color:{conf_color}"> {"▓" * filled}{"░" * empty} {conf}%</span>
+        </div>'''
 
     st.markdown(f"""
     <div class="signal-card {css_class}">
@@ -470,7 +551,7 @@ def render_signal_card(r, card_type="signal"):
             <span class="tag {adx_class}">ADX {r['adx']}</span>
             <span class="tag {mfi_class}">MFI {r['mfi']}</span>
             <span class="tag {stop_class}">Stop {r['stop_pct']}%</span>
-            <span class="tag">ATR {r['atr_pct']}%</span>
+            {rr_html}
             {target_html}
         </div>
         <div class="meta" style="margin-top:4px">
@@ -480,6 +561,7 @@ def render_signal_card(r, card_type="signal"):
             <span class="tag">EMA {r['ema_dist']}%</span>
             <span class="tag">Vol {r['vol_ratio']}x</span>
         </div>
+        {conf_html}
         {reject_html}
     </div>
     """, unsafe_allow_html=True)
@@ -497,92 +579,7 @@ if st.button("🔍 TARAMAYI BAŞLAT", use_container_width=True):
 
     status.markdown('<div style="text-align:center;color:#7a8299;padding:20px;font-family:JetBrains Mono;font-size:0.8rem">📡 170+ hisse indiriliyor (retry destekli)...</div>', unsafe_allow_html=True)
 
-    all_data, download_errors = download_batch_data(SPUS_SHARIAH_STOCKS)
+    all_data, download_errors = cached_download()
     progress.progress(40, text=f"✅ {len(all_data)} hisse indirildi | Analiz ediliyor...")
 
-    results = []
-    total = len(all_data)
-
-    for i, (symbol, data) in enumerate(all_data.items()):
-        try:
-            result = analyze_stock(symbol, data)
-            if result:
-                results.append(result)
-        except Exception:
-            pass
-        if i % 20 == 0:
-            pct = 40 + int((i / max(total, 1)) * 55)
-            progress.progress(min(pct, 95), text=f"Analiz: {i}/{total}")
-
-    progress.progress(98, text="Sınıflandırılıyor...")
-
-    results.sort(key=sort_key)
-
-    wr_radar = [r for r in results if r['wr_pass']]
-    wr_rejected = [r for r in results if r['score'] == 6 and r['priority'] >= 6 and not r['wr_pass']]
-    watching = [r for r in results if r['score'] == 5 and r['priority'] >= 6]
-
-    progress.progress(100, text="Tamamlandı!")
-    time.sleep(0.3)
-    progress.empty()
-    status.empty()
-
-    st.session_state['results'] = results
-    st.session_state['wr_radar'] = wr_radar
-    st.session_state['wr_rejected'] = wr_rejected
-    st.session_state['watching'] = watching
-    st.session_state['scan_time'] = datetime.now().strftime('%Y-%m-%d %H:%M')
-    st.session_state['download_errors'] = download_errors
-
-# Sonuçları göster
-if 'results' in st.session_state:
-    wr_radar = st.session_state['wr_radar']
-    wr_rejected = st.session_state['wr_rejected']
-    watching = st.session_state['watching']
-    results = st.session_state['results']
-    dl_errors = st.session_state.get('download_errors', [])
-
-    scan_info = f"Son tarama: {st.session_state['scan_time']} | {len(results)} hisse analiz edildi"
-    if dl_errors:
-        scan_info += f" | ⚠ {len(dl_errors)} hata"
-    st.markdown(f"<div style='text-align:center;font-size:0.7rem;color:#4a5168;margin-bottom:12px;font-family:JetBrains Mono'>{scan_info}</div>", unsafe_allow_html=True)
-
-    render_stats(len(wr_radar), len(wr_rejected), len(watching), len(results))
-
-    if wr_radar:
-        st.markdown("### 🏆 WR RADAR — İşlem Al")
-        for r in wr_radar:
-            render_signal_card(r, "signal")
-    else:
-        st.markdown("""
-        <div style="text-align:center;padding:30px;background:#12151c;border:1px solid #252a36;border-radius:8px;margin:12px 0">
-            <div style="font-size:2rem">🔇</div>
-            <div style="color:#7a8299;font-size:0.9rem;margin-top:8px">Bugün WR sinyali yok — sabır!</div>
-            <div style="color:#4a5168;font-size:0.75rem;margin-top:4px">Ayda ~1.8 sinyal bekleniyor</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    if wr_rejected:
-        with st.expander(f"⚠ Elenenler ({len(wr_rejected)}) — 6/6 ama WR filtresi dışı"):
-            for r in wr_rejected:
-                render_signal_card(r, "rejected")
-
-    if watching:
-        with st.expander(f"👁 İzleme ({len(watching)}) — 5/6 skorlu yakın adaylar"):
-            for r in watching[:20]:
-                render_signal_card(r, "watching")
-
-else:
-    st.markdown("""
-    <div style="text-align:center;padding:60px 20px">
-        <div style="font-size:3rem;margin-bottom:16px">🎯</div>
-        <div style="color:#7a8299;font-size:1rem">Taramayı başlatmak için butona bas</div>
-        <div style="color:#4a5168;font-size:0.8rem;margin-top:8px">170+ Shariah hisse • WR Mode • Wilder RMA • ~60 saniye</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-st.markdown("""
-<div style="text-align:center;margin-top:40px;padding:16px;border-top:1px solid #252a36;font-size:0.65rem;color:#4a5168;font-family:'JetBrains Mono',monospace">
-    RAMKAR-US WR v1.2 | Scanner ile birebir senkron | ⚠ Yatırım tavsiyesi değildir
-</div>
-""", unsafe_allow_html=True)
+   
