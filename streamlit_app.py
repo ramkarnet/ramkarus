@@ -675,15 +675,10 @@ if 'results' in st.session_state:
         </div>
         """, unsafe_allow_html=True)
 
-    # En yakın adaylar — 5/6 skorlu, sadece 1 kriter eksik, P6+ olanlar
+    # En yakın adaylar — 5/6 skorlu, P6+ olanlar, scanner sıralamasıyla
     almost_there = [r for r in results if r['score'] == 5 and r['priority'] >= 6]
-    # ADX ve MFI'ya en yakın olanları öne al
-    almost_sorted = sorted(almost_there, key=lambda r: (
-        -r['priority'],
-        -(1 if WR_ADX_MIN <= r['adx'] <= WR_ADX_MAX else 0),
-        -(1 if r['mfi'] > WR_MFI_MIN else 0),
-        -r['mfi']
-    ))[:5]
+    # Scanner ile aynı sıralama: priority > score > adx_quality > mfi
+    almost_sorted = sorted(almost_there, key=sort_key)[:10]
 
     if almost_sorted and not wr_radar:
         st.markdown("""
